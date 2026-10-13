@@ -12,7 +12,109 @@ permissions:
 
 jobs:
   sync-upstream:
+    runs-on: ubuntu-latestname: Sync MoonTVPlus upstream and redeploy Cloudflare
+
+on:
+  schedule:
+    # Every day at 10:23 Asia/Taipei (02:23 UTC)
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+# GITHUB_TOKEN is used only to dispatch the Cloudflare workflow.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  sync-upstream:
     runs-on: ubuntu-latest
+    steps:
+      - name: Check token access and repository type
+        id: repo
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::error::Secret UPSTREAM_SYNC_TOKEN is empty or missing."
+            exit 1
+          fi
+
+          # This step gives a distinct failure point if the PAT cannot access this repo.
+          metadata="$(gh api "repos/${REPOSITORY}")"
+          is_fork="$(jq -r '.fork' <<< "$metadata")"
+          parent_repo="$(jq -r '.parent.full_name // ""' <<< "$metadata")"
+          default_branch="$(jq -r '.default_branch' <<< "$metadata")"
+
+          echo "Repository: ${REPOSITORY}"
+          echo "Is fork: ${is_fork}"
+          echo "Upstream parent: ${parent_repo:-none}"
+          echo "Default branch: ${default_branch}"
+
+          if [[ "${is_fork}" != "true" ]]; then
+            echo "::error::This repository is not a GitHub fork. The merge-upstream API only works for forked repositories."
+            echo "::error::If you used 'Use this template' or created a blank repo, a different sync workflow is required."
+            exit 1
+          fi
+
+          if [[ "${parent_repo,,}" != "mtvpls/moontvplus" ]]; then
+            echo "::error::The fork parent is not mtvpls/MoonTVPlus."
+            exit 1
+          fi
+
+          echo "default_branch=${default_branch}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync fork with mtvpls/MoonTVPlus
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ steps.repo.outputs.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          branch="${DEFAULT_BRANCH}"
+          before_sha="$(gh api "repos/${REPOSITORY}/commits/${branch}" --jq '.sha')"
+          echo "Current commit: ${before_sha}"
+          echo "Requesting upstream sync for branch: ${branch}"
+
+          response="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            --method POST \
+            "repos/${REPOSITORY}/merge-upstream" \
+            -f "branch=${branch}")"
+          echo "$response"
+
+          after_sha="$(gh api "repos/${REPOSITORY}/commits/${branch}" --jq '.sha')"
+          echo "Commit after sync: ${after_sha}"
+
+          if [[ "${before_sha}" != "${after_sha}" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream changes were synced."
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork is already up to date; no deployment needed."
+          fi
+
+      - name: Trigger Cloudflare deployment workflow
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ steps.repo.outputs.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Dispatching cloudflare-deploy.yml for ${DEFAULT_BRANCH}"
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/actions/workflows/cloudflare-deploy.yml/dispatches" \
+            -f "ref=${DEFAULT_BRANCH}"
+
     steps:
       - name: Sync fork with mtvpls/MoonTVPlus main
         id: sync
