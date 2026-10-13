@@ -141,8 +141,9 @@ jobs:
           append_var WATCH_ROOM_EXTERNAL_SERVER_URL "${{ secrets.WATCH_ROOM_EXTERNAL_SERVER_URL }}"
           append_var WATCH_ROOM_SERVER_TYPE "${{ secrets.WATCH_ROOM_SERVER_TYPE }}"
           
-          echo "Updated wrangler.toml:"
-          cat wrangler.toml
+          # 注意：不要把 wrangler.toml 打印到日志。
+          # 该文件此时已包含 TMDB_API_KEY / PASSWORD / UPSTASH_TOKEN 等敏感值。
+          echo "wrangler.toml 已更新（内容含敏感信息，不输出到日志）。"
 
       - name: Build for Cloudflare
         run: pnpm run build:cloudflare

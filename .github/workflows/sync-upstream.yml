@@ -1,147 +1,135 @@
-name: Sync MoonTVPlus upstream and redeploy Cloudflare
+name: Sync upstream and redeploy Cloudflare
 
+# 每天 02:23 UTC（北京/台北 10:23）检查上游 mtvpls/MoonTVPlus 是否有新提交；
+# 也可在 Actions 页面手动触发（workflow_dispatch）。
 on:
   schedule:
-    # Every day at 10:23 Asia/Taipei (02:23 UTC)
-    - cron: "23 2 * * *"
+    - cron: '23 2 * * *'
   workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: '即使没有上游更新，也强制触发一次 Cloudflare 部署'
+        required: false
+        default: false
+        type: boolean
+
+# 只需要两个权限：
+#   contents: write -> 把合并结果推送回本 fork 的默认分支
+#   actions: write  -> 通过 workflow_dispatch 派发 cloudflare-deploy.yml
+# 不需要任何 PAT（个人访问令牌）。
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
-  sync-upstream:
-    runs-on: ubuntu-latestname: Sync MoonTVPlus upstream and redeploy Cloudflare
-
-on:
-  schedule:
-    # Every day at 10:23 Asia/Taipei (02:23 UTC)
-    - cron: "23 2 * * *"
-  workflow_dispatch:
-
-# GITHUB_TOKEN is used only to dispatch the Cloudflare workflow.
-permissions:
-  contents: read
-  actions: write
-
-jobs:
-  sync-upstream:
+  sync:
+    name: Sync fork with mtvpls/MoonTVPlus
     runs-on: ubuntu-latest
-    steps:
-      - name: Check token access and repository type
-        id: repo
-        env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${GH_TOKEN}" ]]; then
-            echo "::error::Secret UPSTREAM_SYNC_TOKEN is empty or missing."
-            exit 1
-          fi
-
-          # This step gives a distinct failure point if the PAT cannot access this repo.
-          metadata="$(gh api "repos/${REPOSITORY}")"
-          is_fork="$(jq -r '.fork' <<< "$metadata")"
-          parent_repo="$(jq -r '.parent.full_name // ""' <<< "$metadata")"
-          default_branch="$(jq -r '.default_branch' <<< "$metadata")"
-
-          echo "Repository: ${REPOSITORY}"
-          echo "Is fork: ${is_fork}"
-          echo "Upstream parent: ${parent_repo:-none}"
-          echo "Default branch: ${default_branch}"
-
-          if [[ "${is_fork}" != "true" ]]; then
-            echo "::error::This repository is not a GitHub fork. The merge-upstream API only works for forked repositories."
-            echo "::error::If you used 'Use this template' or created a blank repo, a different sync workflow is required."
-            exit 1
-          fi
-
-          if [[ "${parent_repo,,}" != "mtvpls/moontvplus" ]]; then
-            echo "::error::The fork parent is not mtvpls/MoonTVPlus."
-            exit 1
-          fi
-
-          echo "default_branch=${default_branch}" >> "$GITHUB_OUTPUT"
-
-      - name: Sync fork with mtvpls/MoonTVPlus
-        id: sync
-        env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ steps.repo.outputs.default_branch }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          branch="${DEFAULT_BRANCH}"
-          before_sha="$(gh api "repos/${REPOSITORY}/commits/${branch}" --jq '.sha')"
-          echo "Current commit: ${before_sha}"
-          echo "Requesting upstream sync for branch: ${branch}"
-
-          response="$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            --method POST \
-            "repos/${REPOSITORY}/merge-upstream" \
-            -f "branch=${branch}")"
-          echo "$response"
-
-          after_sha="$(gh api "repos/${REPOSITORY}/commits/${branch}" --jq '.sha')"
-          echo "Commit after sync: ${after_sha}"
-
-          if [[ "${before_sha}" != "${after_sha}" ]]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New upstream changes were synced."
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Fork is already up to date; no deployment needed."
-          fi
-
-      - name: Trigger Cloudflare deployment workflow
-        if: steps.sync.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ steps.repo.outputs.default_branch }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Dispatching cloudflare-deploy.yml for ${DEFAULT_BRANCH}"
-          gh api \
-            --method POST \
-            "repos/${REPOSITORY}/actions/workflows/cloudflare-deploy.yml/dispatches" \
-            -f "ref=${DEFAULT_BRANCH}"
 
     steps:
-      - name: Sync fork with mtvpls/MoonTVPlus main
-        id: sync
-        env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-        shell: bash
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and detect new commits
+        id: detect
         run: |
           set -euo pipefail
+          git remote add upstream https://github.com/mtvpls/MoonTVPlus.git 2>/dev/null || true
+          git fetch --no-tags --prune upstream main
 
-          before_sha="$(gh api "repos/${REPOSITORY}/commits/main" --jq '.sha')"
-          response="$(gh api --method POST "repos/${REPOSITORY}/merge-upstream" -f branch=main)"
-          echo "$response"
-          after_sha="$(gh api "repos/${REPOSITORY}/commits/main" --jq '.sha')"
+          local_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse upstream/main)"
+          ahead="$(git rev-list --count upstream/main..HEAD)"
+          behind="$(git rev-list --count HEAD..upstream/main)"
 
-          if [[ "$before_sha" != "$after_sha" ]]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Upstream changes synced: $before_sha -> $after_sha"
+          echo "local HEAD    : ${local_sha}"
+          echo "upstream/main : ${upstream_sha}"
+          echo "fork ahead=${ahead}, behind=${behind}"
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "Fork 已包含上游全部提交，跳过同步与部署。"
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Fork is already up to date; no deployment needed."
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "检测到上游新提交 ${behind} 个。"
           fi
 
-      - name: Trigger existing Cloudflare deployment workflow
-        if: steps.sync.outputs.changed == 'true'
+      # 关键：使用普通 merge，绝不使用 git push --force。
+      # 若与本地自定义提交冲突 -> 中止合并、不推送、保留你的代码，并让本 job 失败以便你察觉。
+      - name: Merge upstream (abort on conflict, never force)
+        id: merge
+        if: steps.detect.outputs.has_update == 'true'
+        run: |
+          set -uo pipefail
+
+          if git merge --no-edit upstream/main; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "合并成功 -> $(git rev-parse --short HEAD)"
+            exit 0
+          fi
+
+          conflicts="$(git diff --name-only --diff-filter=U || true)"
+          git merge --abort || true
+
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 上游同步冲突，已安全中止"
+            echo ""
+            echo "本 fork 的默认分支与上游 \`mtvpls/MoonTVPlus\` 产生冲突。"
+            echo "**未做任何推送**，你的代码、配置与环境变量保持原样。"
+            echo ""
+            echo "冲突文件："
+            echo '```'
+            echo "${conflicts:-（无法列出冲突文件）}"
+            echo '```'
+            echo ""
+            echo "处理方式：在本地执行 \`git fetch upstream && git merge upstream/main\`，"
+            echo "手动解决冲突后推送一次；之后自动同步即可恢复正常。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::上游合并冲突，已中止且未推送。冲突文件：$(echo "$conflicts" | tr '\n' ' ')"
+          exit 1
+
+      - name: Push merged result to fork
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # 故意不使用 --force / --force-with-lease：
+          # 若远端已前进，push 会直接失败并终止，而不是覆盖你的提交。
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+
+      - name: Trigger Cloudflare deployment
+        if: steps.merge.outputs.changed == 'true' || github.event.inputs.force_deploy == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
         run: |
-          gh api --method POST "repos/${REPOSITORY}/actions/workflows/cloudflare-deploy.yml/dispatches" -f ref=main
+          set -euo pipefail
+          # 用 GITHUB_TOKEN 推送产生的 commit 不会触发 on: push 工作流，
+          # 因此这里显式派发 cloudflare-deploy.yml（它本身是 workflow_dispatch）。
+          gh workflow run cloudflare-deploy.yml --ref "${{ github.event.repository.default_branch }}"
+          echo "已派发 Cloudflare 部署工作流。"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 上游同步结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游是否有新提交 | \`${{ steps.detect.outputs.has_update }}\` |"
+            echo "| 是否已合并并推送 | \`${{ steps.merge.outputs.changed }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
