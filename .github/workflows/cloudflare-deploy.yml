@@ -1,6 +1,11 @@
 name: Deploy to Cloudflare
 
 on:
+  # main 有代码更新时自动部署（sync-upstream 用 GITHUB_TOKEN 推送不会触发 push 事件，
+  # 那条路径由 sync 工作流里的 `gh workflow run` 显式派发，两者互为兜底）
+  push:
+    branches: [ main ]
+  # 保留手动触发，可随时重新部署
   workflow_dispatch:
 
 concurrency:
