@@ -1,0 +1,45 @@
+name: Sync MoonTVPlus upstream and redeploy Cloudflare
+
+on:
+  schedule:
+    # Every day at 10:23 Asia/Taipei (02:23 UTC)
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync fork with mtvpls/MoonTVPlus main
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          before_sha="$(gh api "repos/${REPOSITORY}/commits/main" --jq '.sha')"
+          response="$(gh api --method POST "repos/${REPOSITORY}/merge-upstream" -f branch=main)"
+          echo "$response"
+          after_sha="$(gh api "repos/${REPOSITORY}/commits/main" --jq '.sha')"
+
+          if [[ "$before_sha" != "$after_sha" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream changes synced: $before_sha -> $after_sha"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork is already up to date; no deployment needed."
+          fi
+
+      - name: Trigger existing Cloudflare deployment workflow
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --method POST "repos/${REPOSITORY}/actions/workflows/cloudflare-deploy.yml/dispatches" -f ref=main
